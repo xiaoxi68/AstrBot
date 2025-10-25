@@ -1,5 +1,6 @@
 import re
 import json
+import logging
 from typing import Any, Tuple
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -101,82 +102,101 @@ class R1Filter(Star):
     # ------------------------
     # helpers
     # ------------------------
-    def _extract_gemini_texts(self, resp: Any) -> Tuple[str, str]:
-        """
-        从 GenerateContentResponse 中提取思考文本与正文文本。
+    def _get_part_dict(self, p: Any) -> dict:
+        """优先使用 SDK 标准序列化方法获取字典，失败则逐级回退。
 
-        兼容在 parts 中注入 {"thought": true, "text": "..."} 的情况；
-        若无法可靠解析，返回 ("", "").
+        顺序: model_dump → model_dump_json → json → to_dict → dict → __dict__。
+        """
+        for getter in ("model_dump", "model_dump_json", "json", "to_dict", "dict"):
+            fn = getattr(p, getter, None)
+            if callable(fn):
+                try:
+                    result = fn()
+                    if isinstance(result, (str, bytes)):
+                        try:
+                            if isinstance(result, bytes):
+                                result = result.decode("utf-8", "ignore")
+                            return json.loads(result) or {}
+                        except json.JSONDecodeError:
+                            continue
+                    if isinstance(result, dict):
+                        return result
+                except (AttributeError, TypeError):
+                    continue
+                except Exception as e:
+                    logging.exception(
+                        f"Unexpected error when calling {getter} on {type(p).__name__}: {e}"
+                    )
+                    continue
+        try:
+            d = getattr(p, "__dict__", None)
+            if isinstance(d, dict):
+                return d
+        except (AttributeError, TypeError):
+            pass
+        except Exception as e:
+            logging.exception(
+                f"Unexpected error when accessing __dict__ on {type(p).__name__}: {e}"
+            )
+        return {}
+
+    def _is_thought_part(self, p: Any) -> bool:
+        """判断是否为思考片段。
+
+        规则:
+        1) 直接 thought 属性
+        2) 字典字段 thought 或 metadata.thought
+        3) data/raw/extra/_raw 中嵌入的 JSON 串包含 thought: true
         """
         try:
-            candidates = getattr(resp, "candidates", None)
-            if not candidates:
-                return "", ""
-
-            cand0 = candidates[0]
-            content = getattr(cand0, "content", None)
-            parts = getattr(content, "parts", None)
-            if not parts:
-                # 有些实现将纯文本聚合到 resp.text，此时直接返回为空，由上层字符串过滤兜底
-                return "", ""
-
-            thought_buf, answer_buf = [], []
-            for p in parts:
-                txt = getattr(p, "text", None)
-                if not txt:
-                    continue
-                is_thought = False
-
-                # 策略 1：直接属性
-                if hasattr(p, "thought") and getattr(p, "thought") is True:
-                    is_thought = True
-                else:
-                    # 策略 2：to_dict()/dict()/__dict__ 兜底
-                    p_dict = None
-                    for getter in ("to_dict", "dict"):
-                        func = getattr(p, getter, None)
-                        if callable(func):
-                            try:
-                                p_dict = func()
-                                break
-                            except Exception:
-                                p_dict = None
-                    if p_dict is None:
-                        try:
-                            # 某些 dataclass 可直接 __dict__
-                            p_dict = getattr(p, "__dict__", None)
-                        except Exception:
-                            p_dict = None
-
-                    if isinstance(p_dict, dict):
-                        # 直接 thought 字段或嵌套 metadata.thought
-                        if p_dict.get("thought") is True:
-                            is_thought = True
-                        elif isinstance(p_dict.get("metadata"), dict) and p_dict["metadata"].get(
-                            "thought"
-                        ) is True:
-                            is_thought = True
-                        else:
-                            # 某些实现将原始 JSON 串保存在 data 等字段
-                            raw_json = None
-                            for k in ("data", "raw", "extra", "_raw"):
-                                v = p_dict.get(k)
-                                if isinstance(v, (str, bytes)):
-                                    raw_json = v
-                                    break
-                            if raw_json:
-                                try:
-                                    d = json.loads(raw_json)
-                                    if isinstance(d, dict) and d.get("thought") is True:
-                                        is_thought = True
-                                except Exception:
-                                    pass
-
-                if is_thought:
-                    thought_buf.append(txt)
-                else:
-                    answer_buf.append(txt)
-
-            return "\n".join(thought_buf).strip(), "\n".join(answer_buf).strip()
+            if getattr(p, "thought", False):
+                return True
         except Exception:
+            # best-effort
+            pass
+
+        d = self._get_part_dict(p)
+        if d.get("thought") is True:
+            return True
+        meta = d.get("metadata")
+        if isinstance(meta, dict) and meta.get("thought") is True:
+            return True
+        for k in ("data", "raw", "extra", "_raw"):
+            v = d.get(k)
+            if isinstance(v, (str, bytes)):
+                try:
+                    if isinstance(v, bytes):
+                        v = v.decode("utf-8", "ignore")
+                    parsed = json.loads(v)
+                    if isinstance(parsed, dict) and parsed.get("thought") is True:
+                        return True
+                except json.JSONDecodeError:
+                    continue
+        return False
+
+    def _extract_gemini_texts(self, resp: Any) -> Tuple[str, str]:
+        """从 GenerateContentResponse 中提取 (思考文本, 正文文本)。"""
+        try:
+            cand0 = next(iter(getattr(resp, "candidates", []) or []), None)
+            if not cand0:
+                return "", ""
+            content = getattr(cand0, "content", None)
+            parts = getattr(content, "parts", None) or []
+        except (AttributeError, TypeError, ValueError):
             return "", ""
+
+        thought_buf: list[str] = []
+        answer_buf: list[str] = []
+        for p in parts:
+            txt = getattr(p, "text", None)
+            if txt is None:
+                continue
+            txt_str = str(txt).strip()
+            if not txt_str:
+                continue
+            if self._is_thought_part(p):
+                thought_buf.append(txt_str)
+            else:
+                answer_buf.append(txt_str)
+
+        return "\n".join(thought_buf).strip(), "\n".join(answer_buf).strip()
