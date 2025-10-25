@@ -7,6 +7,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api.provider import LLMResponse
 from openai.types.chat.chat_completion import ChatCompletion
+
 try:
     # 谨慎引入，避免在未安装 google-genai 的环境下报错
     from google.genai.types import GenerateContentResponse
