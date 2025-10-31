@@ -1,6 +1,6 @@
 [project]
 name = "AstrBot"
-version = "4.5.0"
+version = "4.5.1"
 description = "易上手的多平台 LLM 聊天机器人及开发框架"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -55,6 +55,7 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "jieba>=0.42.1",
     "markitdown-no-magika[docx,xls,xlsx]>=0.1.2",
+    "xinference-client",
 ]
 
 [project.scripts]
